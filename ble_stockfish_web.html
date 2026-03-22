@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>CYNUS — Stockfish (web)</title>
+  <title>CYNUS — nước đi (Lichess Cloud)</title>
   <style>
     body { font-family: system-ui, sans-serif; max-width: 36rem; margin: 1rem auto; padding: 0 1rem; }
     button { font-size: 1rem; padding: 0.5rem 1rem; margin: 0.25rem 0.25rem 0.25rem 0; cursor: pointer; }
@@ -14,10 +14,12 @@
   </style>
 </head>
 <body>
-  <h1>CYNUS + Stockfish (trình duyệt)</h1>
+  <h1>CYNUS + nước đi (API Lichess)</h1>
   <p class="hint">
-    Engine: <strong>Stockfish 16</strong> (WASM, single-thread), file trong thư mục <code>vendor/</code>
-    (cùng origin với trang — trình duyệt không cho Worker từ CDN khác). Chạy cục bộ, không API cờ ngoài. Cần HTTPS + Chrome (Web Bluetooth).
+    Nước đi lấy từ <strong>Lichess Cloud Eval</strong> — API công khai, miễn phí, không cần token:
+    <a href="https://lichess.org/api" target="_blank" rel="noopener">lichess.org/api</a>
+    (<code>GET /api/cloud-eval?fen=…</code>). Chỉ trả kết quả nếu vị trí đã có trong kho đánh giá cloud (ván lạ / hiếm có thể <strong>404</strong>).
+    Hạn mức: nên gọi tuần tự, tránh spam (429). Cần HTTPS + Chrome (Web Bluetooth).
   </p>
   <div>
     <button id="connect" type="button">Kết nối CYNUS</button>
@@ -31,8 +33,7 @@
   <script>
     const FFF0 = "0000fff0-0000-1000-8000-00805f9b34fb";
     const FFF1 = "0000fff1-0000-1000-8000-00805f9b34fb";
-    /** Stockfish 16 single-thread — file cục bộ (cùng origin) vì Worker từ CDN khác bị chặn trên GitHub Pages */
-    const STOCKFISH_WORKER = new URL("vendor/stockfish-nnue-16-single.js", window.location.href).href;
+    const LICHESS_CLOUD_EVAL = "https://lichess.org/api/cloud-eval";
 
     const enc = new TextEncoder();
     const dec = new TextDecoder();
@@ -47,78 +48,32 @@
     }
 
     let device, server, chNotify;
-    let engineWorker = null;
-    let lineBuf = "";
-    let lineWaiter = null;
-    let lineQueue = [];
 
-    function pushLine(line) {
-      if (!line) return;
-      if (lineWaiter) {
-        const w = lineWaiter;
-        lineWaiter = null;
-        w(line);
-      } else lineQueue.push(line);
-    }
-
-    function readLine() {
-      if (lineQueue.length) return Promise.resolve(lineQueue.shift());
-      return new Promise((r) => { lineWaiter = r; });
-    }
-
-    function attachWorkerHandlers(w) {
-      lineBuf = "";
-      w.onmessage = (e) => {
-        const chunk = typeof e.data === "string" ? e.data : "";
-        lineBuf += chunk;
-        let i;
-        while ((i = lineBuf.indexOf("\n")) >= 0) {
-          const line = lineBuf.slice(0, i).trim();
-          lineBuf = lineBuf.slice(i + 1);
-          pushLine(line);
-        }
-      };
-      w.onerror = (e) => log("Worker: " + (e.message || e), true);
-    }
-
-    function sendUci(cmd) {
-      engineWorker.postMessage(cmd.endsWith("\n") ? cmd : cmd + "\n");
-    }
-
-    async function engineInit() {
-      if (engineWorker) {
-        try { engineWorker.terminate(); } catch (_) {}
-        engineWorker = null;
+    /**
+     * Lichess trả JSON: { pvs: [{ moves: "e2e4 e7e5 ...", cp?: number, mate?: number }] }
+     * Nước đầu trong chuỗi moves là UCI.
+     */
+    async function lichessCloudBestMove(fen) {
+      const url = LICHESS_CLOUD_EVAL + "?fen=" + encodeURIComponent(fen) + "&multiPv=1";
+      const res = await fetch(url, {
+        method: "GET",
+        headers: { Accept: "application/json" },
+      });
+      if (res.status === 404) {
+        throw new Error(
+          "Lichess cloud-eval: 404 — vị trí chưa có trong kho đánh giá. Thử ván mở phổ biến hoặc đợi cloud cập nhật."
+        );
       }
-      engineWorker = new Worker(STOCKFISH_WORKER);
-      attachWorkerHandlers(engineWorker);
-
-      sendUci("uci");
-      while (true) {
-        const line = await readLine();
-        if (line === "uciok") break;
+      if (res.status === 429) {
+        throw new Error("Lichess: quá nhiều request (429). Đợi ~1 phút rồi thử lại.");
       }
-      sendUci("isready");
-      while (true) {
-        const line = await readLine();
-        if (line === "readyok") break;
-      }
-      log("Stockfish sẵn sàng (UCI).");
-    }
-
-    async function engineBestMove(fen, movetimeMs) {
-      sendUci("stop");
-      sendUci("position fen " + fen);
-      sendUci("go movetime " + movetimeMs);
-      while (true) {
-        const line = await readLine();
-        if (line.startsWith("bestmove")) {
-          const parts = line.split(/\s+/);
-          const m = parts[1];
-          if (!m || m === "(none)") throw new Error("bestmove không hợp lệ");
-          return m;
-        }
-      }
+      if (!res.ok) throw new Error("Lichess API HTTP " + res.status);
+      const data = await res.json();
+      const pv = data.pvs && data.pvs[0];
+      if (!pv || typeof pv.moves !== "string") throw new Error("Phản hồi không có pvs/moves.");
+      const first = pv.moves.trim().split(/\s+/)[0];
+      if (!first) throw new Error("Không tách được nước UCI.");
+      return first;
     }
 
     let lastFenPayload = "";
@@ -145,8 +100,8 @@
         moveBusy = true;
         try {
           const curFen = lastFenPayload.trim() + " b - - 0 15";
-          log("Tính nước, FEN: " + curFen);
-          const best = await engineBestMove(curFen, 1000);
+          log("Hỏi Lichess cloud-eval, FEN: " + curFen);
+          const best = await lichessCloudBestMove(curFen);
           log("best move: " + best);
           await writeBle("move " + best + "\r\n");
         } catch (e) {
@@ -165,13 +120,13 @@
 
     async function connect() {
       document.getElementById("connect").disabled = true;
-      log("Đang khởi động engine WASM…");
+      log("Thử ping Lichess cloud-eval (vị trí xuất phát)…");
       try {
-        await engineInit();
+        await lichessCloudBestMove("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        log("API Lichess phản hồi OK.");
       } catch (e) {
-        log("Engine: " + e, true);
-        document.getElementById("connect").disabled = false;
-        return;
+        log("Cảnh báo: " + e, true);
+        log("Vẫn thử kết nối BLE — có thể do mạng hoặc chặn request.");
       }
 
       if (!navigator.bluetooth) {
@@ -188,7 +143,6 @@
         });
       } catch (e) {
         log(String(e), true);
-        try { engineWorker.terminate(); engineWorker = null; } catch (_) {}
         document.getElementById("connect").disabled = false;
         return;
       }
@@ -201,7 +155,7 @@
         chNotify = await service.getCharacteristic(FFF1);
         await chNotify.startNotifications();
         chNotify.addEventListener("characteristicvaluechanged", onBleNotification);
-        log("Đã bật notify FFF1. Chơi trên bàn; khi máy gửi fen + get move sẽ trả nước.");
+        log("Đã bật notify FFF1. Khi máy gửi fen + get move sẽ hỏi Lichess và gửi move …");
         document.getElementById("disconnect").disabled = false;
         document.getElementById("sendcmd").disabled = false;
       } catch (e) {
@@ -226,11 +180,6 @@
       } catch (_) {}
       device = null;
       server = null;
-      if (engineWorker) {
-        try { sendUci("quit"); } catch (_) {}
-        try { engineWorker.terminate(); } catch (_) {}
-        engineWorker = null;
-      }
       lastFenPayload = "";
       log("Đã ngắt.");
       document.getElementById("connect").disabled = false;
