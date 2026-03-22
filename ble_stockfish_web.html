@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CYNUS — Stockfish (web)</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 36rem; margin: 1rem auto; padding: 0 1rem; }
+    button { font-size: 1rem; padding: 0.5rem 1rem; margin: 0.25rem 0.25rem 0.25rem 0; cursor: pointer; }
+    #log { margin-top: 0.75rem; font-size: 0.85rem; white-space: pre-wrap; color: #222; max-height: 14rem; overflow: auto; border: 1px solid #ccc; padding: 0.5rem; background: #fafafa; }
+    .err { color: #b00; }
+    .hint { font-size: 0.9rem; color: #555; }
+    #cmd { width: 100%; box-sizing: border-box; margin-top: 0.5rem; }
+  </style>
+</head>
+<body>
+  <h1>CYNUS + Stockfish (trình duyệt)</h1>
+  <p class="hint">
+    Engine: <strong>Stockfish 16</strong> (WASM, single-thread) tải từ CDN npm
+    <a href="https://www.npmjs.com/package/stockfish" target="_blank" rel="noopener">stockfish</a>
+    — chạy cục bộ trong máy, không gọi API cờ bên ngoài. Cần HTTPS + Chrome (Web Bluetooth).
+  </p>
+  <div>
+    <button id="connect" type="button">Kết nối CYNUS</button>
+    <button id="disconnect" type="button" disabled>Ngắt kết nối</button>
+  </div>
+  <label>Gửi lệnh thủ công (như Python, có thêm CRLF):</label>
+  <input id="cmd" type="text" placeholder="quit" autocomplete="off" />
+  <button id="sendcmd" type="button" disabled>Gửi</button>
+  <div id="log"></div>
+
+  <script>
+    const FFF0 = "0000fff0-0000-1000-8000-00805f9b34fb";
+    const FFF1 = "0000fff1-0000-1000-8000-00805f9b34fb";
+    /** Stockfish 16 single-thread — chạy được trên GitHub Pages, không cần COOP/COEP */
+    const STOCKFISH_WORKER = "https://cdn.jsdelivr.net/npm/stockfish@16.0.0/src/stockfish-nnue-16-single.js";
+
+    const enc = new TextEncoder();
+    const dec = new TextDecoder();
+
+    const logEl = document.getElementById("log");
+    function log(msg, isErr) {
+      const div = document.createElement("div");
+      div.textContent = msg;
+      if (isErr) div.className = "err";
+      logEl.appendChild(div);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    let device, server, chNotify;
+    let engineWorker = null;
+    let lineBuf = "";
+    let lineWaiter = null;
+    let lineQueue = [];
+
+    function pushLine(line) {
+      if (!line) return;
+      if (lineWaiter) {
+        const w = lineWaiter;
+        lineWaiter = null;
+        w(line);
+      } else lineQueue.push(line);
+    }
+
+    function readLine() {
+      if (lineQueue.length) return Promise.resolve(lineQueue.shift());
+      return new Promise((r) => { lineWaiter = r; });
+    }
+
+    function attachWorkerHandlers(w) {
+      lineBuf = "";
+      w.onmessage = (e) => {
+        const chunk = typeof e.data === "string" ? e.data : "";
+        lineBuf += chunk;
+        let i;
+        while ((i = lineBuf.indexOf("\n")) >= 0) {
+          const line = lineBuf.slice(0, i).trim();
+          lineBuf = lineBuf.slice(i + 1);
+          pushLine(line);
+        }
+      };
+      w.onerror = (e) => log("Worker: " + (e.message || e), true);
+    }
+
+    function sendUci(cmd) {
+      engineWorker.postMessage(cmd.endsWith("\n") ? cmd : cmd + "\n");
+    }
+
+    async function engineInit() {
+      if (engineWorker) {
+        try { engineWorker.terminate(); } catch (_) {}
+        engineWorker = null;
+      }
+      engineWorker = new Worker(STOCKFISH_WORKER);
+      attachWorkerHandlers(engineWorker);
+
+      sendUci("uci");
+      while (true) {
+        const line = await readLine();
+        if (line === "uciok") break;
+      }
+      sendUci("isready");
+      while (true) {
+        const line = await readLine();
+        if (line === "readyok") break;
+      }
+      log("Stockfish sẵn sàng (UCI).");
+    }
+
+    async function engineBestMove(fen, movetimeMs) {
+      sendUci("stop");
+      sendUci("position fen " + fen);
+      sendUci("go movetime " + movetimeMs);
+      while (true) {
+        const line = await readLine();
+        if (line.startsWith("bestmove")) {
+          const parts = line.split(/\s+/);
+          const m = parts[1];
+          if (!m || m === "(none)") throw new Error("bestmove không hợp lệ");
+          return m;
+        }
+      }
+    }
+
+    let lastFenPayload = "";
+    let moveBusy = false;
+
+    async function onBleNotification(event) {
+      const value = event.target.value;
+      const u8 = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+      log("RX: " + dec.decode(u8));
+
+      if (u8.length >= 4 && u8[0] === 0x66 && u8[1] === 0x65 && u8[2] === 0x6E && u8[3] === 0x3A) {
+        const inner = u8.subarray(5, Math.max(5, u8.length - 2));
+        lastFenPayload = dec.decode(inner);
+        return;
+      }
+
+      const head = dec.decode(u8.subarray(0, Math.min(8, u8.length)));
+      if (head.startsWith("get move")) {
+        if (moveBusy) return;
+        if (!lastFenPayload.trim()) {
+          log("get move nhưng chưa có FEN.", true);
+          return;
+        }
+        moveBusy = true;
+        try {
+          const curFen = lastFenPayload.trim() + " b - - 0 15";
+          log("Tính nước, FEN: " + curFen);
+          const best = await engineBestMove(curFen, 1000);
+          log("best move: " + best);
+          await writeBle("move " + best + "\r\n");
+        } catch (e) {
+          log(String(e), true);
+        } finally {
+          moveBusy = false;
+        }
+      }
+    }
+
+    async function writeBle(text) {
+      const buf = enc.encode(text);
+      if (chNotify.properties.writeWithoutResponse) await chNotify.writeValueWithoutResponse(buf);
+      else await chNotify.writeValue(buf);
+    }
+
+    async function connect() {
+      document.getElementById("connect").disabled = true;
+      log("Đang khởi động engine WASM…");
+      try {
+        await engineInit();
+      } catch (e) {
+        log("Engine: " + e, true);
+        document.getElementById("connect").disabled = false;
+        return;
+      }
+
+      if (!navigator.bluetooth) {
+        log("Không có Web Bluetooth.", true);
+        document.getElementById("connect").disabled = false;
+        return;
+      }
+
+      let dev;
+      try {
+        dev = await navigator.bluetooth.requestDevice({
+          filters: [{ namePrefix: "CYNUS-" }],
+          optionalServices: [FFF0],
+        });
+      } catch (e) {
+        log(String(e), true);
+        try { engineWorker.terminate(); engineWorker = null; } catch (_) {}
+        document.getElementById("connect").disabled = false;
+        return;
+      }
+
+      device = dev;
+      try {
+        log("BLE: kết nối GATT…");
+        server = await device.gatt.connect();
+        const service = await server.getPrimaryService(FFF0);
+        chNotify = await service.getCharacteristic(FFF1);
+        await chNotify.startNotifications();
+        chNotify.addEventListener("characteristicvaluechanged", onBleNotification);
+        log("Đã bật notify FFF1. Chơi trên bàn; khi máy gửi fen + get move sẽ trả nước.");
+        document.getElementById("disconnect").disabled = false;
+        document.getElementById("sendcmd").disabled = false;
+      } catch (e) {
+        log("BLE: " + e, true);
+        try { await disconnect(); } catch (_) {}
+        document.getElementById("connect").disabled = false;
+      }
+    }
+
+    async function disconnect() {
+      document.getElementById("disconnect").disabled = true;
+      document.getElementById("sendcmd").disabled = true;
+      try {
+        if (chNotify) {
+          chNotify.removeEventListener("characteristicvaluechanged", onBleNotification);
+          await chNotify.stopNotifications();
+        }
+      } catch (_) {}
+      chNotify = null;
+      try {
+        if (device && device.gatt.connected) device.gatt.disconnect();
+      } catch (_) {}
+      device = null;
+      server = null;
+      if (engineWorker) {
+        try { sendUci("quit"); } catch (_) {}
+        try { engineWorker.terminate(); } catch (_) {}
+        engineWorker = null;
+      }
+      lastFenPayload = "";
+      log("Đã ngắt.");
+      document.getElementById("connect").disabled = false;
+    }
+
+    document.getElementById("connect").addEventListener("click", connect);
+    document.getElementById("disconnect").addEventListener("click", disconnect);
+
+    document.getElementById("sendcmd").addEventListener("click", async () => {
+      const t = document.getElementById("cmd").value;
+      if (!chNotify || !t) return;
+      if (t === "quit") {
+        await disconnect();
+        return;
+      }
+      await writeBle(t + "\r\n");
+      log("TX: " + t);
+    });
+
+    document.getElementById("cmd").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") document.getElementById("sendcmd").click();
+    });
+  </script>
+</body>
+</html>
