@@ -16,9 +16,8 @@
 <body>
   <h1>CYNUS + Stockfish (trình duyệt)</h1>
   <p class="hint">
-    Engine: <strong>Stockfish 16</strong> (WASM, single-thread) tải từ CDN npm
-    <a href="https://www.npmjs.com/package/stockfish" target="_blank" rel="noopener">stockfish</a>
-    — chạy cục bộ trong máy, không gọi API cờ bên ngoài. Cần HTTPS + Chrome (Web Bluetooth).
+    Engine: <strong>Stockfish 16</strong> (WASM, single-thread), file trong thư mục <code>vendor/</code>
+    (cùng origin với trang — trình duyệt không cho Worker từ CDN khác). Chạy cục bộ, không API cờ ngoài. Cần HTTPS + Chrome (Web Bluetooth).
   </p>
   <div>
     <button id="connect" type="button">Kết nối CYNUS</button>
@@ -32,8 +31,8 @@
   <script>
     const FFF0 = "0000fff0-0000-1000-8000-00805f9b34fb";
     const FFF1 = "0000fff1-0000-1000-8000-00805f9b34fb";
-    /** Stockfish 16 single-thread — chạy được trên GitHub Pages, không cần COOP/COEP */
-    const STOCKFISH_WORKER = "https://cdn.jsdelivr.net/npm/stockfish@16.0.0/src/stockfish-nnue-16-single.js";
+    /** Stockfish 16 single-thread — file cục bộ (cùng origin) vì Worker từ CDN khác bị chặn trên GitHub Pages */
+    const STOCKFISH_WORKER = new URL("vendor/stockfish-nnue-16-single.js", window.location.href).href;
 
     const enc = new TextEncoder();
     const dec = new TextDecoder();
